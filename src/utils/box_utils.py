@@ -1,178 +1,190 @@
-# box_utils.py
-import torch
 import numpy as np
+import torch
 
 
 def calculate_iou(box1, box2):
-    """
-    Calculate Intersection over Union (IoU) between two bounding boxes
-
-    Args:
-        box1: Bounding box in format [x1, y1, x2, y2]
-        box2: Bounding box in format [x1, y1, x2, y2]
-
-    Returns:
-        IoU score
-    """
-    # Get the coordinates of the intersection rectangle
+    """Calculate IoU between two boxes"""
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
 
-    # Calculate area of intersection
-    intersection_area = max(0, x2 - x1) * max(0, y2 - y1)
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
 
-    # Calculate area of both bounding boxes
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-
-    # Calculate union area
-    union_area = box1_area + box2_area - intersection_area
-
-    # Calculate IoU
-    iou = intersection_area / union_area if union_area > 0 else 0
-
-    return iou
+    return intersection / union if union > 0 else 0
 
 
-def generate_proposals(
-    image_size, scales=[64, 128, 256], aspect_ratios=[0.5, 1, 2], stride=16
-):
+def calculate_iou_matrix(boxes1, boxes2):
+    """Calculate IoU matrix between two sets of boxes"""
+    n1 = len(boxes1)
+    n2 = len(boxes2)
+    iou_matrix = np.zeros((n1, n2))
+
+    for i in range(n1):
+        for j in range(n2):
+            iou_matrix[i, j] = calculate_iou(boxes1[i], boxes2[j])
+
+    return iou_matrix
+
+
+def compute_bbox_targets(proposals, gt_boxes):
     """
-    Generate region proposals using a sliding window approach
+    Compute regression targets and labels for proposals
 
     Args:
-        image_size: Size of the image (height, width)
-        scales: List of scales for the proposals
-        aspect_ratios: List of aspect ratios for the proposals
-        stride: Stride for sliding window
+        proposals: Array of proposal boxes [N, 4]
+        gt_boxes: Array of ground truth boxes [M, 4]
 
     Returns:
-        List of proposals in format [x1, y1, x2, y2]
+        targets: Regression targets [N, 4]
+        labels: Binary labels (0: background, 1: object) [N]
     """
-    height, width = image_size
-    proposals = []
+    if len(gt_boxes) == 0:
+        return np.zeros((len(proposals), 4)), np.zeros(len(proposals), dtype=np.int64)
 
-    for scale in scales:
-        for ratio in aspect_ratios:
-            # Calculate width and height of the proposal
-            w = int(scale * np.sqrt(ratio))
-            h = int(scale / np.sqrt(ratio))
+    # Calculate IoU between all proposals and ground truth boxes
+    ious = calculate_iou_matrix(proposals, gt_boxes)
 
-            # Slide window over the image
-            for y in range(0, height - h + 1, stride):
-                for x in range(0, width - w + 1, stride):
-                    proposals.append([x, y, x + w, y + h])
+    # Find best matching GT box for each proposal
+    max_ious = ious.max(axis=1)
+    max_indices = ious.argmax(axis=1)
 
-    return torch.tensor(proposals, dtype=torch.float32)
+    # Assign labels (1 for IoU >= 0.5, 0 otherwise)
+    labels = (max_ious >= 0.5).astype(np.int64)
+
+    # Get corresponding GT boxes for each proposal
+    target_boxes = gt_boxes[max_indices]
+
+    # Compute regression targets
+    targets = encode_boxes(proposals, target_boxes)
+
+    return targets, labels
 
 
-def filter_proposals(proposals, scores, threshold=0.5, max_proposals=300):
+def encode_boxes(proposals, gt_boxes):
     """
-    Filter proposals based on confidence scores
-
-    Args:
-        proposals: Tensor of proposals in format [x1, y1, x2, y2]
-        scores: Confidence scores for each proposal
-        threshold: Confidence threshold
-        max_proposals: Maximum number of proposals to keep
-
-    Returns:
-        Filtered proposals and their scores
+    Encode ground truth boxes w.r.t proposals
     """
-    # Filter by threshold
-    mask = scores > threshold
-    filtered_proposals = proposals[mask]
-    filtered_scores = scores[mask]
+    # Prevent division by zero
+    eps = 1e-6
 
-    # Sort by score and take top max_proposals
-    if len(filtered_scores) > max_proposals:
-        _, indices = torch.sort(filtered_scores, descending=True)
-        indices = indices[:max_proposals]
-        filtered_proposals = filtered_proposals[indices]
-        filtered_scores = filtered_scores[indices]
+    px = (proposals[:, 0] + proposals[:, 2]) / 2
+    py = (proposals[:, 1] + proposals[:, 3]) / 2
+    pw = proposals[:, 2] - proposals[:, 0] + eps
+    ph = proposals[:, 3] - proposals[:, 1] + eps
 
-    return filtered_proposals, filtered_scores
+    gx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
+    gy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
+    gw = gt_boxes[:, 2] - gt_boxes[:, 0]
+    gh = gt_boxes[:, 3] - gt_boxes[:, 1]
+
+    dx = (gx - px) / pw
+    dy = (gy - py) / ph
+    dw = np.log(gw / pw)
+    dh = np.log(gh / ph)
+
+    return np.stack([dx, dy, dw, dh], axis=1)
 
 
-def apply_nms(boxes, scores, iou_threshold=0.5):
+def decode_boxes(proposals, deltas):
     """
-    Apply Non-Maximum Suppression to avoid duplicate detections
-
-    Args:
-        boxes: Tensor of boxes in format [x1, y1, x2, y2]
-        scores: Confidence scores for each box
-        iou_threshold: IoU threshold for considering boxes as duplicates
-
-    Returns:
-        Indices of boxes to keep
+    Decode predicted box deltas to get final boxes
     """
-    # Sort boxes by score
-    _, indices = torch.sort(scores, descending=True)
-    boxes = boxes[indices]
+    px = (proposals[:, 0] + proposals[:, 2]) / 2
+    py = (proposals[:, 1] + proposals[:, 3]) / 2
+    pw = proposals[:, 2] - proposals[:, 0]
+    ph = proposals[:, 3] - proposals[:, 1]
+
+    dx = deltas[:, 0]
+    dy = deltas[:, 1]
+    dw = deltas[:, 2]
+    dh = deltas[:, 3]
+
+    gx = dx * pw + px
+    gy = dy * ph + py
+    gw = torch.exp(dw) * pw
+    gh = torch.exp(dh) * ph
+
+    x1 = gx - gw / 2
+    y1 = gy - gh / 2
+    x2 = gx + gw / 2
+    y2 = gy + gh / 2
+
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+
+def apply_nms(boxes, scores, threshold=0.5):
+    """Apply Non-Maximum Suppression"""
+    if len(boxes) == 0:
+        return []
+
+    # Convert to numpy if tensor
+    if isinstance(boxes, torch.Tensor):
+        boxes = boxes.cpu().numpy()
+    if isinstance(scores, torch.Tensor):
+        scores = scores.cpu().numpy()
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
 
     keep = []
-    while indices.size(0) > 0:
-        # Keep the box with highest score
-        keep.append(indices[0].item())
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
 
-        # Calculate IoU of this box with all remaining boxes
-        ious = torch.tensor([calculate_iou(boxes[0], box) for box in boxes[1:]])
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
 
-        # Find boxes with IoU less than threshold
-        mask = ious < iou_threshold
-        indices = indices[1:][mask]
-        boxes = boxes[1:][mask]
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+
+        inter = w * h
+        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+
+        inds = np.where(ovr <= threshold)[0]
+        order = order[inds + 1]
 
     return keep
 
 
-def calculate_precision_recall(pred_boxes, true_boxes, iou_threshold=0.5):
-    """
-    Calculate precision and recall for object detection
+def calculate_precision_recall(pred_boxes, gt_boxes, iou_threshold=0.5):
+    """Calculate precision and recall"""
+    if len(pred_boxes) == 0:
+        return 0, 0
 
-    Args:
-        pred_boxes: Predicted bounding boxes
-        true_boxes: Ground truth bounding boxes
-        iou_threshold: IoU threshold for considering a prediction correct
+    if len(gt_boxes) == 0:
+        return 0, 1
 
-    Returns:
-        precision, recall
-    """
-    # Initialize counters
-    tp = 0  # True positives
-    fp = 0  # False positives
-    fn = 0  # False negatives
+    # Calculate IoU matrix
+    ious = calculate_iou_matrix(pred_boxes, gt_boxes)
 
-    # Mark ground truth boxes as unmatched initially
-    matched_gt = [False] * len(true_boxes)
+    # Find matches
+    matched_gt = set()
+    matched_pred = 0
 
-    # Check each predicted box
-    for pred_box in pred_boxes:
-        best_iou = 0
-        best_gt_idx = -1
+    for i in range(len(pred_boxes)):
+        max_iou = 0
+        max_j = -1
+        for j in range(len(gt_boxes)):
+            if j not in matched_gt and ious[i, j] > max_iou:
+                max_iou = ious[i, j]
+                max_j = j
 
-        # Find the best matching ground truth box
-        for i, gt_box in enumerate(true_boxes):
-            if not matched_gt[i]:  # Only consider unmatched ground truth boxes
-                iou = calculate_iou(pred_box, gt_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = i
+        if max_iou >= iou_threshold:
+            matched_pred += 1
+            matched_gt.add(max_j)
 
-        # Check if the best match is good enough
-        if best_iou >= iou_threshold:
-            tp += 1
-            matched_gt[best_gt_idx] = True  # Mark this ground truth box as matched
-        else:
-            fp += 1
-
-    # Count unmatched ground truth boxes as false negatives
-    fn = matched_gt.count(False)
-
-    # Calculate precision and recall
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    precision = matched_pred / len(pred_boxes) if len(pred_boxes) > 0 else 0
+    recall = len(matched_gt) / len(gt_boxes) if len(gt_boxes) > 0 else 0
 
     return precision, recall

@@ -1,81 +1,27 @@
 import os
-import json
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import Image
 
-# Import our modules
-from data.data_preparation import get_transforms, MathExpressionDataset
+from data.data_preparation import get_test_loader, MathExpressionDataset, get_transforms
 from models.rcnn import RCNN
-from utils.box_utils import calculate_iou, apply_nms
-
-# Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from utils.box_utils import calculate_iou, apply_nms, decode_boxes
+from utils.region_proposal import selective_search
 
 
-def visualize_predictions(image, pred_boxes, gt_boxes=None, save_path=None):
-    """
-    Visualize predicted and ground truth bounding boxes on an image
+def evaluate_model(model_path, root_dir, output_dir, num_samples=10):
+    """Evaluate trained model and visualize results"""
 
-    Args:
-        image: PIL Image or tensor
-        pred_boxes: Predicted bounding boxes in format [x1, y1, x2, y2]
-        gt_boxes: Ground truth bounding boxes in format [x1, y1, x2, y2] (optional)
-        save_path: Path to save the visualization (optional)
-
-    Returns:
-        PIL Image with visualized boxes
-    """
-    # Convert tensor to PIL Image if needed
-    if isinstance(image, torch.Tensor):
-        image = Image.fromarray(
-            (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        )
-
-    # Create a copy of the image for drawing
-    draw_image = image.copy()
-    draw = ImageDraw.Draw(draw_image)
-
-    # Draw predicted boxes in red
-    for box in pred_boxes:
-        x1, y1, x2, y2 = box
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-
-    # Draw ground truth boxes in green if provided
-    if gt_boxes is not None:
-        for box in gt_boxes:
-            x1, y1, x2, y2 = box
-            draw.rectangle([x1, y1, x2, y2], outline="green", width=2)
-
-    # Save the image if a path is provided
-    if save_path:
-        draw_image.save(save_path)
-
-    return draw_image
-
-
-def evaluate_model(model_path, root_dir, output_dir, num_samples=10, iou_threshold=0.5):
-    """
-    Evaluate the trained model and visualize results
-
-    Args:
-        model_path: Path to the trained model
-        root_dir: Root directory of the dataset
-        output_dir: Directory to save results
-        num_samples: Number of samples to visualize
-        iou_threshold: IoU threshold for evaluation
-
-    Returns:
-        Evaluation metrics
-    """
-    # Create output directory if it doesn't exist
+    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Initialize model
+    # Load model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = RCNN().to(device)
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
     # Create validation dataset
@@ -83,122 +29,164 @@ def evaluate_model(model_path, root_dir, output_dir, num_samples=10, iou_thresho
         root_dir=root_dir, split="val", transform=get_transforms(train=False)
     )
 
-    # Select random samples for visualization
-    sample_indices = np.random.choice(len(val_dataset), num_samples, replace=False)
-
     # Evaluation metrics
     all_precisions = []
     all_recalls = []
     all_ious = []
 
-    # Process each sample
-    for idx in tqdm(sample_indices, desc="Evaluating samples"):
-        # Get sample
+    # Process samples
+    for idx in tqdm(range(min(num_samples, len(val_dataset))), desc="Evaluating"):
         image, target, img_name = val_dataset[idx]
 
-        # Move to device
-        image = image.to(device)
-        gt_boxes = target["boxes"].to(device)
+        # Generate proposals
+        proposals = selective_search(image, max_proposals=500)
 
-        # Skip samples without ground truth boxes
-        if len(gt_boxes) == 0:
+        if len(proposals) == 0:
             continue
+
+        # Convert to tensor
+        proposals_tensor = torch.tensor(proposals, dtype=torch.float32).to(device)
+        image_tensor = image.unsqueeze(0).to(device)
 
         # Get predictions
         with torch.no_grad():
-            class_scores, bbox_deltas, valid_indices = model(image.unsqueeze(0), gt_boxes.unsqueeze(0))
+            class_scores, bbox_deltas, _ = model(image_tensor, proposals_tensor)
 
-        # Get predicted class (0: background, 1: character)
-        _, pred_classes = torch.max(class_scores, 1)
+        # Get predicted classes
+        probs = torch.softmax(class_scores, dim=1)
+        char_probs = probs[:, 1]  # Probability of being a character
 
-        # Filter character predictions
-        char_indices = (pred_classes == 1).nonzero(as_tuple=True)[0]
-        pred_boxes = bbox_deltas[char_indices]
+        # Filter by confidence threshold
+        conf_threshold = 0.5
+        high_conf_indices = (char_probs > conf_threshold).nonzero(as_tuple=True)[0]
 
-        # Apply NMS to remove duplicate predictions
-        keep_indices = apply_nms(
-            pred_boxes, class_scores[char_indices, 1], iou_threshold
-        )
-        final_boxes = pred_boxes[keep_indices]
+        if len(high_conf_indices) > 0:
+            # Get high confidence proposals and their deltas
+            high_conf_proposals = proposals_tensor[high_conf_indices]
+            high_conf_deltas = bbox_deltas[high_conf_indices]
+            high_conf_scores = char_probs[high_conf_indices]
 
-        # Calculate IoU for each prediction with best matching ground truth
-        for pred_box in final_boxes:
-            ious = [
-                calculate_iou(pred_box.cpu().numpy(), gt_box.cpu().numpy())
-                for gt_box in gt_boxes
-            ]
-            all_ious.append(max(ious) if ious else 0)
+            # Decode bounding boxes
+            pred_boxes = decode_boxes(high_conf_proposals, high_conf_deltas)
 
-        # Calculate precision and recall
-        from utils.box_utils import calculate_precision_recall
+            # Apply NMS
+            keep_indices = apply_nms(pred_boxes, high_conf_scores, threshold=0.3)
 
-        precision, recall = calculate_precision_recall(
-            final_boxes.cpu().numpy(), gt_boxes.cpu().numpy(), iou_threshold
-        )
+            if len(keep_indices) > 0:
+                final_boxes = pred_boxes[keep_indices]
+                final_scores = high_conf_scores[keep_indices]
 
-        all_precisions.append(precision)
-        all_recalls.append(recall)
+                # Calculate metrics
+                gt_boxes = target["boxes"]
 
-        # Visualize predictions
-        save_path = os.path.join(output_dir, f"{img_name}_pred.png")
-        visualize_predictions(
-            image, final_boxes.cpu().numpy(), gt_boxes.cpu().numpy(), save_path
-        )
+                # Calculate IoUs
+                for pred_box in final_boxes:
+                    ious = [
+                        calculate_iou(pred_box.cpu().numpy(), gt_box.numpy())
+                        for gt_box in gt_boxes
+                    ]
+                    if ious:
+                        all_ious.append(max(ious))
 
-    # Calculate mean metrics
-    mean_precision = np.mean(all_precisions) if all_precisions else 0
-    mean_recall = np.mean(all_recalls) if all_recalls else 0
-    mean_iou = np.mean(all_ious) if all_ious else 0
+                # Calculate precision/recall
+                tp = 0
+                for gt_box in gt_boxes:
+                    ious = [
+                        calculate_iou(pred_box.cpu().numpy(), gt_box.numpy())
+                        for pred_box in final_boxes
+                    ]
+                    if ious and max(ious) >= 0.5:
+                        tp += 1
 
-    # Calculate F1 score
-    f1_score = (
-        2 * (mean_precision * mean_recall) / (mean_precision + mean_recall)
-        if (mean_precision + mean_recall) > 0
+                precision = tp / len(final_boxes) if len(final_boxes) > 0 else 0
+                recall = tp / len(gt_boxes) if len(gt_boxes) > 0 else 0
+
+                all_precisions.append(precision)
+                all_recalls.append(recall)
+
+                # Visualize results
+                if idx < 5:  # Visualize first 5 samples
+                    visualize_predictions(
+                        image,
+                        final_boxes.cpu().numpy(),
+                        gt_boxes.numpy(),
+                        final_scores.cpu().numpy(),
+                        img_name,
+                        output_dir,
+                    )
+
+    # Calculate overall metrics
+    metrics = {
+        "precision": np.mean(all_precisions) if all_precisions else 0,
+        "recall": np.mean(all_recalls) if all_recalls else 0,
+        "mean_iou": np.mean(all_ious) if all_ious else 0,
+    }
+
+    metrics["f1_score"] = (
+        2
+        * metrics["precision"]
+        * metrics["recall"]
+        / (metrics["precision"] + metrics["recall"])
+        if (metrics["precision"] + metrics["recall"]) > 0
         else 0
     )
 
-    # Save metrics
-    metrics = {
-        "precision": mean_precision,
-        "recall": mean_recall,
-        "iou": mean_iou,
-        "f1_score": f1_score,
-    }
-
-    with open(os.path.join(output_dir, "evaluation_metrics.json"), "w") as f:
-        json.dump(metrics, f)
-
-    # Plot IoU distribution
-    plt.figure(figsize=(10, 6))
-    plt.hist(all_ious, bins=20, alpha=0.7, color="blue")
-    plt.axvline(
-        x=mean_iou, color="red", linestyle="--", label=f"Mean IoU: {mean_iou:.4f}"
-    )
-    plt.xlabel("IoU")
-    plt.ylabel("Count")
-    plt.title("Distribution of IoU Values")
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, "iou_distribution.png"))
-
-    # Print metrics
-    print(f"Evaluation Metrics:")
-    print(f"Precision: {mean_precision:.4f}")
-    print(f"Recall: {mean_recall:.4f}")
-    print(f"Mean IoU: {mean_iou:.4f}")
-    print(f"F1 Score: {f1_score:.4f}")
+    print(f"\nEvaluation Results:")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall: {metrics['recall']:.4f}")
+    print(f"Mean IoU: {metrics['mean_iou']:.4f}")
+    print(f"F1 Score: {metrics['f1_score']:.4f}")
 
     return metrics
 
 
-if __name__ == "__main__":
-    # Evaluation configuration
-    config = {
-        "model_path": "./results/rcnn/best_model.pth",
-        "root_dir": "./",
-        "output_dir": "./results/rcnn/evaluation",
-        "num_samples": 10,
-        "iou_threshold": 0.5,
-    }
+def visualize_predictions(image, pred_boxes, gt_boxes, scores, img_name, output_dir):
+    """Visualize predictions and ground truth"""
 
-    # Evaluate model
-    metrics = evaluate_model(**config)
+    # Denormalize image
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    image = image.permute(1, 2, 0).cpu().numpy()
+    image = (image * std + mean) * 255
+    image = image.astype(np.uint8)
+
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    ax.imshow(image)
+
+    # Plot ground truth boxes in green
+    for box in gt_boxes:
+        rect = patches.Rectangle(
+            (box[0], box[1]),
+            box[2] - box[0],
+            box[3] - box[1],
+            linewidth=2,
+            edgecolor="green",
+            facecolor="none",
+            label="Ground Truth",
+        )
+        ax.add_patch(rect)
+
+    # Plot predictions in red
+    for box, score in zip(pred_boxes, scores):
+        rect = patches.Rectangle(
+            (box[0], box[1]),
+            box[2] - box[0],
+            box[3] - box[1],
+            linewidth=2,
+            edgecolor="red",
+            facecolor="none",
+            label=f"Pred: {score:.2f}",
+        )
+        ax.add_patch(rect)
+        ax.text(
+            box[0], box[1] - 5, f"{score:.2f}", color="red", fontsize=8, weight="bold"
+        )
+
+    ax.set_title(f"Predictions for {img_name}")
+    ax.axis("off")
+
+    # Save figure
+    output_path = os.path.join(output_dir, f"pred_{img_name}")
+    plt.savefig(output_path, bbox_inches="tight", dpi=150)
+    plt.close()

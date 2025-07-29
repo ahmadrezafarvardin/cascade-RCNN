@@ -33,6 +33,15 @@ def main():
         default=None,
         help="Path to the trained model for evaluation",
     )
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument(
+        "--debug", action="store_true", help="Debug mode with detailed logging"
+    )
+    parser.add_argument(
+        "--use_hybrid",
+        action="store_true",
+        help="Use hybrid training with GT proposals",
+    )
 
     args = parser.parse_args()
 
@@ -44,6 +53,14 @@ def main():
     print(f"Using device: {device}")
 
     if not args.eval_only:
+        # Check if we should resume
+        if args.resume:
+            checkpoint_path = os.path.join(args.output_dir, "checkpoint.pth")
+            if not os.path.exists(checkpoint_path):
+                print(f"Warning: No checkpoint found at {checkpoint_path}")
+                print("Starting training from scratch...")
+                args.resume = False
+
         # Train model
         print("Training model...")
         model, history = train_model(
@@ -52,6 +69,8 @@ def main():
             batch_size=args.batch_size,
             num_epochs=args.num_epochs,
             learning_rate=args.learning_rate,
+            resume=args.resume,  # Pass the resume flag
+            use_hybrid=args.use_hybrid,
         )
 
         model_path = os.path.join(args.output_dir, "best_model.pth")

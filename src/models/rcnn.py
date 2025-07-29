@@ -1,4 +1,3 @@
-# rcnn.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,7 +67,7 @@ class BBoxRegressor(nn.Module):
         # Regression layers
         self.fc1 = nn.Linear(flat_size, 1024)
         self.fc2 = nn.Linear(1024, 256)
-        self.fc3 = nn.Linear(256, 4)  # 4 coordinates: [x1, y1, x2, y2]
+        self.fc3 = nn.Linear(256, 4)  # 4 coordinates: [dx, dy, dw, dh]
 
     def forward(self, x):
         x = x.view(x.size(0), -1)  # Flatten
@@ -95,21 +94,15 @@ class RCNN(nn.Module):
         features = self.feature_extractor(image)
 
         # Apply ROI pooling to extract fixed-size features for each ROI
-        roi_features, valid_indices = self.roi_pooling(
-            features, rois, self.roi_size, image
-        )
+        roi_features = self.roi_pooling(features, rois, self.roi_size, image)
 
         # Check if we have any valid ROIs
         if roi_features.size(0) == 0:
             # Return empty tensors with correct shapes if no valid ROIs
             return (
-                torch.zeros(
-                    (0, 2), device=features.device
-                ),  # Empty class scores (0 x 2)
-                torch.zeros(
-                    (0, 4), device=features.device
-                ),  # Empty bbox deltas (0 x 4)
-                valid_indices,
+                torch.zeros((0, 2), device=features.device),
+                torch.zeros((0, 4), device=features.device),
+                torch.tensor([], dtype=torch.long, device=features.device),
             )
 
         # Classify each ROI
@@ -118,65 +111,77 @@ class RCNN(nn.Module):
         # Predict bounding box refinements for each ROI
         bbox_deltas = self.bbox_regressor(roi_features)
 
+        # Return all indices since we're not filtering in roi_pooling anymore
+        valid_indices = torch.arange(roi_features.size(0), device=features.device)
+
         return class_scores, bbox_deltas, valid_indices
 
     def roi_pooling(self, features, rois, output_size, image):
         """
-        Simple ROI pooling implementation with tracking of valid ROIs
+        Simple ROI pooling implementation
 
         Args:
             features: Feature maps from the backbone [batch_size, channels, height, width]
-            rois: Region proposals [batch_size, num_rois, 4] with format [x1, y1, x2, y2]
+            rois: Region proposals [batch_size, num_rois, 4] or [num_rois, 4]
             output_size: Size of the output feature map after ROI pooling
             image: Original input image tensor
 
         Returns:
-            Tuple of (pooled features, valid indices)
+            Pooled features [num_rois, channels, output_size, output_size]
         """
+        # Handle both batched and unbatched ROIs
+        if rois.dim() == 2:
+            rois = rois.unsqueeze(0)
+
         batch_size = features.size(0)
         num_channels = features.size(1)
+        feature_h = features.size(2)
+        feature_w = features.size(3)
 
-        # Initialize output tensor
+        # Get image dimensions
+        img_h = image.size(2)
+        img_w = image.size(3)
+
+        # Scale factors
+        scale_h = feature_h / img_h
+        scale_w = feature_w / img_w
+
         pooled_features = []
-        valid_indices = []  # Track which ROIs are valid
 
         for i in range(batch_size):
-            batch_rois = rois[i]
-            for j, roi in enumerate(batch_rois):
-                x1, y1, x2, y2 = roi
+            batch_rois = rois[i] if rois.size(0) > 1 else rois[0]
 
-                # Convert to integers and ensure within feature map bounds
-                x1 = max(0, int(x1 * features.size(3) / image.size(3)))
-                y1 = max(0, int(y1 * features.size(2) / image.size(2)))
-                x2 = min(
-                    features.size(3) - 1, int(x2 * features.size(3) / image.size(3))
-                )
-                y2 = min(
-                    features.size(2) - 1, int(y2 * features.size(2) / image.size(2))
-                )
+            for roi in batch_rois:
+                # Scale ROI coordinates to feature map size
+                x1 = int(roi[0] * scale_w)
+                y1 = int(roi[1] * scale_h)
+                x2 = int(roi[2] * scale_w)
+                y2 = int(roi[3] * scale_h)
 
-                # Skip invalid ROIs
-                if x1 >= x2 or y1 >= y2:
-                    continue
+                # Ensure valid coordinates
+                x1 = max(0, min(x1, feature_w - 1))
+                y1 = max(0, min(y1, feature_h - 1))
+                x2 = max(x1 + 1, min(x2, feature_w))
+                y2 = max(y1 + 1, min(y2, feature_h))
 
                 # Extract ROI from feature map
                 roi_features = features[i, :, y1:y2, x1:x2]
 
                 # Apply adaptive pooling to get fixed size output
-                roi_features = F.adaptive_max_pool2d(roi_features, output_size)
+                if roi_features.numel() > 0:
+                    roi_features = F.adaptive_max_pool2d(roi_features, output_size)
+                else:
+                    # If ROI is invalid, create zero features
+                    roi_features = torch.zeros(
+                        num_channels, output_size, output_size, device=features.device
+                    )
 
                 pooled_features.append(roi_features)
-                valid_indices.append(j)  # Store the index of valid ROI
 
         # Stack all ROIs
-        if not pooled_features:
-            return (
-                torch.zeros(
-                    0, num_channels, output_size, output_size, device=features.device
-                ),
-                torch.tensor([], dtype=torch.long, device=features.device),
+        if pooled_features:
+            return torch.stack(pooled_features)
+        else:
+            return torch.zeros(
+                0, num_channels, output_size, output_size, device=features.device
             )
-
-        return torch.stack(pooled_features), torch.tensor(
-            valid_indices, device=features.device
-        )

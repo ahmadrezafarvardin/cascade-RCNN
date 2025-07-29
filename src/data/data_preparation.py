@@ -26,8 +26,7 @@ class MathExpressionDataset(Dataset):
         # Define paths
         self.images_dir = os.path.join(root_dir, "dataset", split, "images")
         if split != "test":
-            self.labels_dir = os.path.join(
-                root_dir, "dataset", split, "labels")
+            self.labels_dir = os.path.join(root_dir, "dataset", split, "labels")
 
         # Get image file names
         self.image_files = sorted(
@@ -45,8 +44,7 @@ class MathExpressionDataset(Dataset):
         # Load image
         img_name = self.image_files[idx]
         img_path = os.path.join(self.images_dir, img_name)
-        image = Image.open(img_path).convert(
-            "RGB")  # Convert to RGB for consistency
+        image = Image.open(img_path).convert("RGB")
 
         # Get original image dimensions
         orig_width, orig_height = image.size
@@ -70,20 +68,39 @@ class MathExpressionDataset(Dataset):
                 w = bbox.get("width", 0)
                 h = bbox.get("height", 0)
 
-                # Convert to [x1, y1, x2, y2] format (left, top, right, bottom)
+                # Convert to [x1, y1, x2, y2] format
                 boxes.append([x, y, x + w, y + h])
 
             # Convert to tensor
             if boxes:
                 boxes = torch.tensor(boxes, dtype=torch.float32)
             else:
-                # Empty tensor if no boxes
                 boxes = torch.zeros((0, 4), dtype=torch.float32)
+
+            # Apply transforms to image
+            if self.transform:
+                image = self.transform(image)
+
+                # Scale boxes to match transformed image size
+                # After transform, image is (3, 416, 416)
+                new_h, new_w = image.shape[1], image.shape[2]
+
+                # Scale factors
+                scale_x = new_w / orig_width
+                scale_y = new_h / orig_height
+
+                # Scale all boxes
+                if len(boxes) > 0:
+                    boxes[:, [0, 2]] *= scale_x  # Scale x coordinates
+                    boxes[:, [1, 3]] *= scale_y  # Scale y coordinates
+
+                    # Ensure boxes are within image bounds
+                    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, new_w)
+                    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, new_h)
 
             # Create target dictionary
             target = {
                 "boxes": boxes,
-                # All boxes are class 1 (character)
                 "labels": torch.ones(len(boxes), dtype=torch.int64),
                 "image_id": torch.tensor([idx]),
                 "area": (
@@ -92,15 +109,12 @@ class MathExpressionDataset(Dataset):
                     else torch.zeros(0)
                 ),
                 "iscrowd": torch.zeros((len(boxes),), dtype=torch.int64),
+                "orig_size": torch.tensor([orig_height, orig_width]),
             }
 
             # Get expression if available
             if "expression" in annotation:
                 target["expression"] = annotation["expression"]
-
-            # Apply transforms
-            if self.transform:
-                image = self.transform(image)
 
             return image, target, img_name
 
@@ -127,12 +141,10 @@ def get_transforms(train=True, target_size=(416, 416)):
         return transforms.Compose(
             [
                 transforms.Resize(target_size),
-                transforms.ColorJitter(
-                    brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                 transforms.RandomRotation(5),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [
-                                     0.229, 0.224, 0.225]),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
     else:
@@ -140,8 +152,7 @@ def get_transforms(train=True, target_size=(416, 416)):
             [
                 transforms.Resize(target_size),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [
-                                     0.229, 0.224, 0.225]),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
 
