@@ -1,3 +1,4 @@
+# train.py
 import os
 import json
 import time
@@ -46,10 +47,12 @@ def train_one_epoch(model, dataloader, optimizer, criterion_cls, criterion_reg, 
                 continue
 
             # Get predictions
-            class_scores, bbox_deltas = model(image.unsqueeze(0), gt_boxes.unsqueeze(0))
+            class_scores, bbox_deltas, valid_indices = model(
+                image.unsqueeze(0), gt_boxes.unsqueeze(0)
+            )
 
-            # Ground truth labels (all 1 for characters)
-            gt_labels = torch.ones(len(gt_boxes), dtype=torch.long).to(device)
+            # Ground truth labels (all 1 for characters) -> Create gt_labels for valid ROIs only
+            gt_labels = torch.ones(len(valid_indices), dtype=torch.long).to(device)
 
             # Calculate classification loss
             cls_loss = criterion_cls(class_scores, gt_labels)
@@ -114,21 +117,35 @@ def evaluate(model, dataloader, device, iou_threshold=0.5):
                     continue
 
                 # Get predictions
-                class_scores, bbox_deltas = model(
+                class_scores, bbox_deltas, valid_indices = model(
                     image.unsqueeze(0), gt_boxes.unsqueeze(0)
                 )
+
+                # Skip if no valid predictions
+                if class_scores.size(0) == 0:
+                    continue
 
                 # Get predicted class (0: background, 1: character)
                 _, pred_classes = torch.max(class_scores, 1)
 
                 # Filter character predictions
                 char_indices = (pred_classes == 1).nonzero(as_tuple=True)[0]
+
+                # Skip if no character predictions
+                if len(char_indices) == 0:
+                    continue
+
                 pred_boxes = bbox_deltas[char_indices]
 
                 # Apply NMS to remove duplicate predictions
                 keep_indices = apply_nms(
                     pred_boxes, class_scores[char_indices, 1], iou_threshold
                 )
+
+                # Skip if no boxes after NMS
+                if len(keep_indices) == 0:
+                    continue
+
                 final_boxes = pred_boxes[keep_indices]
 
                 # Calculate IoU for each prediction with best matching ground truth

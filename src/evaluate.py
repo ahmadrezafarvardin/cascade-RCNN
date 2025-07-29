@@ -106,7 +106,7 @@ def evaluate_model(model_path, root_dir, output_dir, num_samples=10, iou_thresho
 
         # Get predictions
         with torch.no_grad():
-            class_scores, bbox_deltas = model(image.unsqueeze(0), gt_boxes.unsqueeze(0))
+            class_scores, bbox_deltas, valid_indices = model(image.unsqueeze(0), gt_boxes.unsqueeze(0))
 
         # Get predicted class (0: background, 1: character)
         _, pred_classes = torch.max(class_scores, 1)
