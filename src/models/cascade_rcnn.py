@@ -170,6 +170,15 @@ class CascadeRCNN(nn.Module):
             # Get anchors for this image
             anchors_i = anchors[i]  # Shape: [H*W*A, 4]
 
+            # Calculate losses if training
+            if self.training and targets is not None:
+                losses_i = self.compute_rpn_loss(
+                    objectness, pred_boxes, anchors_i, targets[i]
+                )
+                total_class_loss += losses_i["rpn_class_loss"]
+                total_reg_loss += losses_i["rpn_regression_loss"]
+                num_samples += 1
+
             # Decode boxes from RPN predictions
             proposals_i = self.decode_boxes(pred_boxes, anchors_i)
 
@@ -181,23 +190,22 @@ class CascadeRCNN(nn.Module):
             proposals_i = proposals_i[keep]
             objectness_i = objectness[keep]
 
-            # Apply NMS
-            keep = torch.ops.torchvision.nms(proposals_i, objectness_i.sigmoid(), 0.7)
+            # Apply NMS with lower threshold for more diverse proposals
+            keep = torch.ops.torchvision.nms(
+                proposals_i, objectness_i.sigmoid(), 0.5
+            )  # Lowered from 0.7
 
             # Keep top proposals
-            keep = keep[: min(2000, len(keep))]
+            if self.training:
+                # During training, keep more proposals
+                keep = keep[: min(2000, len(keep))]
+            else:
+                # During inference, keep fewer but higher quality proposals
+                keep = keep[: min(1000, len(keep))]
+
             proposals_i = proposals_i[keep]
 
             proposals.append(proposals_i)
-
-            # Calculate losses if training
-            if self.training and targets is not None:
-                losses_i = self.compute_rpn_loss(
-                    objectness, pred_boxes, anchors_i, targets[i]
-                )
-                total_class_loss += losses_i["rpn_class_loss"]
-                total_reg_loss += losses_i["rpn_regression_loss"]
-                num_samples += 1
 
         if self.training and num_samples > 0:
             losses = {
