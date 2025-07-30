@@ -209,15 +209,15 @@ class CascadeROIHeads(nn.Module):
             proposals, targets, iou_threshold
         )
 
-        # Debug: print statistics
-        num_positive = (labels > 0).sum().item()
-        num_negative = (labels == 0).sum().item()
-        total_samples = len(labels)
+        # # Debug: print statistics
+        # num_positive = (labels > 0).sum().item()
+        # num_negative = (labels == 0).sum().item()
+        # total_samples = len(labels)
 
-        if stage == 0:  # Only print for first stage to avoid clutter
-            print(
-                f"Stage {stage} - Positive: {num_positive}, Negative: {num_negative}, Total: {total_samples}"
-            )
+        # if stage == 0:  # Only print for first stage to avoid clutter
+        #     print(
+        #         f"Stage {stage} - Positive: {num_positive}, Negative: {num_negative}, Total: {total_samples}"
+        #     )
 
         # Classification loss
         classification_loss = F.cross_entropy(class_logits, labels)

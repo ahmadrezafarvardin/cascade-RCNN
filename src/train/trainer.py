@@ -65,9 +65,10 @@ dataset_train = MathExpressionDataset(root_dir, "train", get_transform(train=Tru
 dataset_val = MathExpressionDataset(root_dir, "val", get_transform(train=False))
 
 
-# In trainer.py main function:
+# In trainer.py, update the main function:
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     # Initialize model
     backbone = SimpleBackbone()
@@ -78,6 +79,9 @@ def main():
     root_dir = os.path.join(os.path.dirname(__file__), "..", "..", "dataset")
     dataset_train = MathExpressionDataset(root_dir, "train", get_transform(train=True))
     dataset_val = MathExpressionDataset(root_dir, "val", get_transform(train=False))
+
+    print(f"Training samples: {len(dataset_train)}")
+    print(f"Validation samples: {len(dataset_val)}")
 
     data_loader_train = DataLoader(
         dataset_train, batch_size=2, shuffle=True, collate_fn=collate_fn, num_workers=4
@@ -90,14 +94,24 @@ def main():
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
 
+    # Learning rate scheduler
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
     # Training loop
     num_epochs = 10
+    best_map = 0
+
     for epoch in range(num_epochs):
+        # Train
         train_loss, loss_components = train_one_epoch(
             model, optimizer, data_loader_train, device, epoch
         )
 
-        # Evaluation
+        # Update learning rate
+        lr_scheduler.step()
+
+        # Evaluate
+        print("\nEvaluating...")
         val_metrics = evaluate(model, data_loader_val, device)
 
         print(f"\nEpoch {epoch+1}/{num_epochs} Summary:")
@@ -107,14 +121,33 @@ def main():
             print(f"  {k}: {v:.4f}")
         print(f"Val mAP@0.5: {val_metrics['map_50']:.4f}")
         print(f"Val Recall: {val_metrics['recall']:.4f}")
+        print(f"Val F1 Score: {val_metrics['f1_score']:.4f}")
+        print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         print("-" * 50)
 
-    # Create results directory if it doesn't exist
-    os.makedirs("results", exist_ok=True)
+        # Save checkpoint
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+            "train_loss": train_loss,
+            "val_metrics": val_metrics,
+        }
 
-    # Save model
-    torch.save(model.state_dict(), "results/cascade_rcnn_char_detection.pth")
-    print("Model saved to results/cascade_rcnn_char_detection.pth")
+        # Create results directory if it doesn't exist
+        os.makedirs("results", exist_ok=True)
+
+        # Save latest checkpoint
+        torch.save(checkpoint, "results/cascade_rcnn_latest.pth")
+
+        # Save best model
+        if val_metrics["map_50"] > best_map:
+            best_map = val_metrics["map_50"]
+            torch.save(checkpoint, "results/cascade_rcnn_best.pth")
+            print(f"New best model saved with mAP: {best_map:.4f}")
+
+    print(f"\nTraining completed! Best mAP@0.5: {best_map:.4f}")
 
 
 if __name__ == "__main__":
