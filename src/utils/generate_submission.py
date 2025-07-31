@@ -154,7 +154,7 @@ def generate_submission():
 
     # Create DataFrame and save to CSV
     df = pd.DataFrame(results)
-    output_path = os.path.join(os.path.dirname(__file__), "..", "..", "output.csv")
+    output_path = os.path.join(os.path.dirname(__file__), "..", "..", "results", "output.csv")
     df.to_csv(output_path, index=False)
 
     # Print summary
