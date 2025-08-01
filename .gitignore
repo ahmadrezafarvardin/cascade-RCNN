@@ -20,3 +20,13 @@ Thumbs.db
 .env
 *.env
 dataset_yolo/
+
+# Data and generated files
+dataset/
+dataset_yolo/
+results/
+
+# Training outputs
+*.pt
+*.pth
+*.onnx
