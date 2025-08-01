@@ -26,9 +26,6 @@ class CascadeRCNN(nn.Module):
             in_channels=backbone.out_channels, num_stages=num_stages
         )
 
-    # In cascade_rcnn.py, update the forward method's ROI heads section:
-
-    # In cascade_rcnn.py, update the forward method:
     def forward(self, images, targets=None):
         # Feature extraction
         features = self.backbone(images)

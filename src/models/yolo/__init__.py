@@ -1,0 +1,1 @@
+from .yolo_character_detector import YOLOCharacterDetector
