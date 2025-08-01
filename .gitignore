@@ -30,3 +30,5 @@ results/
 *.pt
 *.pth
 *.onnx
+*.txt
+*.csv
